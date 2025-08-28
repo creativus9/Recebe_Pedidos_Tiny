@@ -5,71 +5,94 @@ const axios = require('axios');
 
 // Cria uma instância do aplicativo Express.
 const app = express();
-
-// Middleware para permitir que o Express entenda requisições com corpo em JSON.
 app.use(express.json());
 
 // --- CONFIGURAÇÕES ---
-// Suas informações do Tiny ERP inseridas diretamente no código.
 const TINY_API_TOKEN = '62c5bc5db80bf5ef0c26a3a33f15db309da48b5612e90fe786d30b9d2184675a';
-const TINY_API_URL_OBTER = 'https://api.tiny.com.br/api2/pedido.obter.php';
-
-// Define a porta em que o servidor vai rodar. O Railway fornecerá essa variável.
-// Se estiver rodando localmente, usará a porta 3000.
+const TINY_API_URL_OBTER_PEDIDO = 'https://api.tiny.com.br/api2/pedido.obter.php';
+const TINY_API_URL_PESQUISA_CONTAS = 'https://api.tiny.com.br/api2/contas.receber.pesquisa.php';
+const TINY_API_URL_OBTER_CONTA = 'https://api.tiny.com.br/api2/contas.receber.obter.php';
 const PORT = process.env.PORT || 3000;
 // --- FIM DAS CONFIGURAÇÕES ---
 
 /**
- * Rota principal para processar os pedidos.
- * Ficará escutando por requisições POST em /processar-pedido
+ * Função auxiliar para extrair mensagens de erro da resposta da API do Tiny.
+ * @param {object} retorno O objeto 'retorno' da resposta da API.
+ * @returns {string} Uma mensagem de erro formatada.
  */
-app.post('/processar-pedido', async (req, res) => {
-  // Pega o 'orderId' que o n8n enviou no corpo (body) da requisição.
-  const { orderId } = req.body;
+const getTinyErrorMessage = (retorno) => {
+  if (retorno && retorno.registros && retorno.registros.registro && retorno.registros.registro.erros) {
+    // Se houver uma lista de erros, junta todos numa única string.
+    return retorno.registros.registro.erros.join(', ');
+  }
+  return 'A API do Tiny retornou um erro, mas sem detalhes específicos.';
+};
 
+app.post('/processar-pedido', async (req, res) => {
+  const { orderId } = req.body;
   console.log(`[INFO] Recebida requisição para processar o pedido ID: ${orderId}`);
 
-  // Validação: Verifica se o n8n realmente enviou o orderId.
   if (!orderId) {
     console.warn('[AVISO] Requisição recebida sem um orderId.');
-    // Retorna um erro 400 (Bad Request) indicando que a requisição está mal formatada.
-    return res.status(400).json({ error: 'O campo "orderId" é obrigatório no corpo da requisição.' });
+    return res.status(400).json({ error: 'O campo "orderId" é obrigatório.' });
   }
 
-  // Prepara os parâmetros para a chamada à API do Tiny.
-  const params = new URLSearchParams();
-  params.append('token', TINY_API_TOKEN);
-  params.append('id', orderId);
-  params.append('formato', 'JSON');
-
   try {
-    // Faz a chamada POST para a API do Tiny.
-    const tinyResponse = await axios.post(TINY_API_URL_OBTER, params);
+    // ETAPA 1: Obter os detalhes do pedido
+    console.log(`[INFO] Etapa 1: Buscando detalhes do pedido ${orderId}...`);
+    const paramsPedido = new URLSearchParams({ token: TINY_API_TOKEN, id: orderId, formato: 'JSON' });
+    const pedidoResponse = await axios.post(TINY_API_URL_OBTER_PEDIDO, paramsPedido);
 
-    // Verifica se a resposta do Tiny foi bem-sucedida.
-    if (tinyResponse.data.retorno && tinyResponse.data.retorno.status === 'OK') {
-      console.log(`[SUCESSO] Detalhes do pedido ${orderId} obtidos com sucesso.`);
-      // Envia o objeto completo do pedido de volta para o n8n.
-      res.status(200).json(tinyResponse.data.retorno.pedido);
-    } else {
-      // Se o Tiny retornou um erro conhecido (ex: pedido não encontrado).
-      console.error(`[ERRO] A API do Tiny retornou um erro:`, tinyResponse.data.retorno);
-      res.status(400).json({ 
-        error: 'A API do Tiny retornou um erro.', 
-        details: tinyResponse.data.retorno 
-      });
+    if (pedidoResponse.data.retorno.status !== 'OK') {
+      const errorMessage = getTinyErrorMessage(pedidoResponse.data.retorno);
+      throw new Error(`Erro ao obter pedido: ${errorMessage}`);
     }
+    const pedido = pedidoResponse.data.retorno.pedido;
+    const idNotaFiscal = pedido.id_nota_fiscal;
+
+    // Se não houver nota fiscal, não podemos buscar dados financeiros.
+    if (!idNotaFiscal) {
+      console.log(`[INFO] Pedido ${orderId} não possui nota fiscal. Retornando apenas dados do pedido.`);
+      return res.status(200).json({ pedido, financeiro: null });
+    }
+    
+    console.log(`[INFO] Etapa 2: Pedido ${orderId} tem NF ID: ${idNotaFiscal}. Pesquisando conta a receber...`);
+    
+    // ETAPA 2: Pesquisar a conta a receber usando o ID da Nota Fiscal
+    const paramsPesquisaConta = new URLSearchParams({ token: TINY_API_TOKEN, idNotaFiscal, formato: 'JSON' });
+    const pesquisaContaResponse = await axios.post(TINY_API_URL_PESQUISA_CONTAS, paramsPesquisaConta);
+
+    // Se a pesquisa falhar ou não retornar resultados, encerramos o fluxo aqui.
+    if (pesquisaContaResponse.data.retorno.status !== 'OK' || pesquisaContaResponse.data.retorno.numero_paginas === 0) {
+      console.log(`[INFO] Nenhuma conta a receber encontrada para a NF ${idNotaFiscal}. Retornando apenas dados do pedido.`);
+      return res.status(200).json({ pedido, financeiro: null });
+    }
+
+    const idContaReceber = pesquisaContaResponse.data.retorno.contas[0].id;
+    console.log(`[INFO] Etapa 3: Conta a Receber encontrada (ID: ${idContaReceber}). Buscando detalhes...`);
+
+    // ETAPA 3: Obter os detalhes da conta a receber
+    const paramsObterConta = new URLSearchParams({ token: TINY_API_TOKEN, id: idContaReceber, formato: 'JSON' });
+    const contaResponse = await axios.post(TINY_API_URL_OBTER_CONTA, paramsObterConta);
+
+    if (contaResponse.data.retorno.status !== 'OK') {
+      const errorMessage = getTinyErrorMessage(contaResponse.data.retorno);
+      throw new Error(`Erro ao obter conta a receber: ${errorMessage}`);
+    }
+    const financeiro = contaResponse.data.retorno.conta;
+
+    console.log(`[SUCESSO] Dados do pedido e financeiros obtidos para o pedido ${orderId}.`);
+    res.status(200).json({ pedido, financeiro });
+
   } catch (error) {
-    // Se ocorreu um erro de rede ou na própria requisição.
-    console.error('[ERRO FATAL] Falha ao conectar com a API do Tiny:', error.message);
-    res.status(502).json({ 
-      error: 'Falha ao comunicar com a API do Tiny.',
+    console.error('[ERRO FATAL] Ocorreu um erro no processamento:', error.message);
+    res.status(500).json({ 
+      error: 'Falha no processamento do pedido.',
       details: error.message
     });
   }
 });
 
-// Inicia o servidor para que ele comece a "escutar" por requisições na porta definida.
 app.listen(PORT, () => {
   console.log(`[INFO] Servidor iniciado e escutando na porta ${PORT}`);
 });
